@@ -1,0 +1,900 @@
+================================================================================
+                    SmartVision 알고리즘 플로우 (업데이트)
+                   3D 객체 감지 및 충돌 위험도 평가
+================================================================================
+
+문서 목적:
+  - 현재 워크스페이스의 실제 코드(감지, 추적, 예측, 위험도, 시각화)를 읽어
+    최신 구현을 반영한 알고리즘 플로우를 명확하게 정리합니다.
+
+요약 변경사항(2026-01-29 기준):
+  - 깊이 이상치 제거: `example_usage.py`에 IQR 기반 필터 `_filter_depth_with_iqr()` 적용
+  - BEV 출력: BEV 전용 및 메인+BEV 동시 저장 스크립트(`bev_only_output.py`, `both_outputs.py`) 추가
+  - 시각화 색상 통일: `visualization_core.py`에 색상 상수 도입 (RED/ORANGE/GREEN 등)
+  - 평가용 스캐폴딩: `evaluation/` 폴더(메트릭/배치처리)와 관련 문서 추가
+
+================================================================================
+【 전체 시스템 아키텍처 】
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  입력: 카메라(RGB) + 선택적 깊이 프레임(RealSense)         │
+    │    - RealSense 사용 시: RGB + Depth (깊이 단위: m)         │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  1) 객체 감지 (ObjectDetectionCore)                         │
+    │     - YOLOv11n 모델 사용 (config: size=nano, conf=0.25)     │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  2) 추적 (KalmanTracker + 선택적 YOLO 내부 트래커)         │
+    │     - 칼만 필터는 상태 벡터(위치, 크기, yaw, 속도 등)를 유지  │
+    │     - 현재 구현: YOLO 내부 추적과 칼만의 병행 사용 가능     │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  3) 깊이 추출 및 전처리                                     │
+    │     - RealSense: 바운딩박스 ROI에서 깊이값 추출
+    │     - IQR 기반 이상치 제거: Q1/Q3 및 1.5*IQR 범위를 벗어난 값 제거
+    │     - (선택) Temporal 필터 버퍼를 적용하여 프레임 간 안정화
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  4) 미래 위치 예측 (KalmanTracker.predict_future())         │
+    │     - 등속 모델(Constant Velocity)로 N 프레임(기본 16) 예측  │
+    │     - future_positions 반환: 1..N 프레임 이후 위치 배열     │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  5) 충돌 위험도 평가 (CollisionRiskAssessment)              │
+    │     - 계산 항목: 현재 거리, 상대속도, TTC, 충돌확률, 영향도   │
+    │     - TTC: closing_speed 기반, 음수나 0이면 충돌 없음으로 처리
+    │     - 위험 임계치: TTC_DANGER=2.0s, TTC_CAUTION=3.5s          │
+    │     - collision_probability: TTC, 거리, 상대속도 가중 합     │
+    │     - risk_score: TTC(40) + 거리(30) + 속도(20) + 확률(10) 합산
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  6) 시각화 및 출력 (Visualizer + BirdEyeViewRenderer)      │
+    │     - 2D: 3D 바운딩박스, 객체 텍스트(ID, 클래스, 거리, 리스크)
+    │     - BEV: 조감도, 거리 그리드, 자차 위치, 위험 색상 표시    │
+    │     - 색상/심볼 통일: `!!`=빨강(위험), `!`=주황(주의)        │
+    │     - 출력: 화면 표시 + 파일 저장 (메인 프레임, BEV 별도)  │
+    └─────────────────────────────────────────────────────────────┘
+
+================================================================================
+【 상세 프로세스 플로우 (프레임 단위) 】
+
+입력: RGB (및 선택적 Depth)
+  1) `ObjectDetectionCore.detect(rgb)` → `detections` 리스트
+     - 각 detection: bbox [x1,y1,x2,y2], confidence, class_id, class_name
+
+  2) 깊이 추출 (가능할 때)
+     - `example_usage._estimate_depth_from_bbox(depth_frame, bbox)`
+       - ROI내 유효 깊이값(>0) 선택
+       - IQR로 이상치 제거: Q1,Q3,IQR 계산 후 중앙값 사용
+       - 결과가 없으면 이전 depth 또는 추정값 사용
+
+  3) 추적 및 상태 갱신
+     - `KalmanTracker.update(detection_measurement)`
+       - 예측(prediction) → 측정치로 업데이트 → 상태(위치, 속도) 반환
+     - 속도 계산은 칼만 상태를 우선 사용 (권장)
+
+  4) 미래 위치 예측
+     - `KalmanTracker.predict_future(frames=16)` → future_positions
+
+  5) 위험도 평가
+     - `CollisionRiskAssessment.assess_risk(filtered_state, ego_state)`
+       - current_distance = ||obj_pos - ego_pos||
+       - relative_velocity = dot(obj_vel - ego_vel, direction)
+       - closing_speed = -relative_velocity (양수면 접근)
+       - TTC = (current_distance - safety_distance) / closing_speed
+       - collision_probability = sum(weighted indicators) (clamped to 1.0)
+       - risk_score, risk_level 도출 (SAFE/CAUTION/DANGER)
+
+  6) 시각화 및 저장
+     - 2D 프레임에 3D box, 텍스트, 위험 바 표시
+     - BEV 렌더러에 객체 점표시(색상: RED/ORANGE/GREEN), 거리 표시
+     - 파일 저장 옵션:
+         - 메인 출력 MP4 (기본)
+         - BEV 전용 MP4 (추가 파일) — `example_usage.run(output_bev_file=...)`
+
+================================================================================
+【 주요 파라미터 & 구현 위치 】
+
+객체 감지:
+  - 파일: `object_detection_core.py` (YOLO 래퍼)
+  - 주요: `model_size`, `conf_threshold`, `iou_threshold`, `device`
+
+칼만 필터:
+  - 파일: `kalman_tracker.py`
+  - 상태 벡터 예: x,y,z,width,height,length,yaw,vx,vy,vz,v_yaw
+  - 파라미터: `process_noise_scale`, `measurement_noise_scale`, `max_history`
+
+깊이 전처리:
+  - 파일: `example_usage.py`
+  - 함수: `_filter_depth_with_iqr(depth_array, roi_mask=None)` (IQR),
+           (권장) `DepthTemporalFilter` 클래스 사용 가능
+
+충돌 평가:
+  - 파일: `collision_risk_assessment.py`
+  - 주요 함수: `_calculate_ttc()`, `_calculate_collision_probability()`, `_calculate_collision_impact()`
+
+시각화:
+  - 파일: `visualization_core.py`
+  - 색상 상수: `COLOR_RED`, `COLOR_ORANGE`, `COLOR_GREEN`, 등으로 통일
+  - BEV/2D 합성 및 저장 기능 포함
+
+기타(유틸/스크립트):
+  - `bev_only_output.py`, `both_outputs.py`: 데모/녹화용 래퍼
+  - `evaluation/` 폴더: 메트릭/배치 테스트 스캐폴딩 (추가 구현 필요)
+
+================================================================================
+【 문제점, 개선사항 요약 (코드 기반 권장) 】
+
+단기 (지금 바로 적용)
+  - 깊이 이상치 제거(IQR) 적용: 이미 구현됨
+  - Temporal depth smoothing: `DepthTemporalFilter` 권장(미구현)
+  - 색상/심볼 통일: 이미 적용됨
+
+중기 (1~2주)
+  - YOLO 내부 트래커와 칼만 병행 제거: YOLO는 detection 전용, 매칭은 Hungarian으로 전환
+  - 속도 계산 일원화: 칼만 상태에 기반한 velocity 사용
+  - ego-motion 보정(자차 속도 입력) 추가
+
+장기 (2~4주)
+  - 센서 융합(LiDAR/IMU) 및 confidence map 활용
+  - 궤적 기반 충돌 가능성(교점 계산) 및 행동 예측(behavior prediction)
+
+================================================================================
+【 실행 예시 (빠른 테스트) 】
+  - 메인 실행 (BEV 포함 저장):
+      python QUICK_START.py
+  - BEV만 녹화 테스트:
+      python bev_only_output.py
+  - 메인 + BEV 동시 녹화:
+      python both_outputs.py
+
+================================================================================
+【 참고: 코드 위치 링크 】
+  - 주요 구현 파일: [collision_risk_assessment.py](collision_risk_assessment.py)
+  - 파이프라인 실행기: [example_usage.py](example_usage.py)
+  - 시각화: [visualization_core.py](visualization_core.py)
+  - 칼만 트래커: [kalman_tracker.py](kalman_tracker.py)
+  - 객체 감지: [object_detection_core.py](object_detection_core.py)
+
+================================================================================
+문서 생성일: 2026-01-29
+변경내역: IQR 깊이 필터 적용, BEV 출력 스크립트 추가, 시각화 색상 통일 반영
+================================================================================
+================================================================================
+                    SmartVision 알고리즘 플로우
+                   3D 객체 감지 및 충돌 위험도 평가
+================================================================================
+
+【 전체 시스템 아키텍처 】
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  입력: 카메라 영상 (RealSense D435i 또는 웹캠)             │
+    │       RGB 프레임 + 깊이 프레임 (RealSense인 경우)         │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  [1단계] 객체 감지 (Object Detection Core)                  │
+    │  - YOLOv11 기반 실시간 객체 인식                            │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  [2단계] 칼만 필터 기반 추적 (Kalman Tracker)               │
+    │  - 객체 위치/크기/방향 평활화 및 속도 추정                 │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  [3단계] 미래 위치 예측                                      │
+    │  - 16프레임(~0.5초) 미래 위치 예측 (등속 모델)             │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  [4단계] 충돌 위험도 평가 (Collision Risk Assessment)       │
+    │  - TTC 계산, 충돌 확률 평가, 위험도 등급 판정              │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  [5단계] 시각화 및 출력                                      │
+    │  - 3D 바운딩박스, 위험도 표시, 조감도(BEV) 렌더링         │
+    │  - 결과 영상 출력 및 저장                                   │
+    └─────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+【 상세 프로세스 플로우 】
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[1단계] 객체 감지 (ObjectDetectionCore.detect())
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+입력:
+  - RGB 프레임 (640x480 또는 가변 해상도)
+  - enable_tracking: True (YOLO 내부 추적 활성화)
+
+처리:
+  1) YOLOv11n 모델로 객체 감지
+     ├─ 모델 크기: nano, small, medium, large, extra
+     ├─ 신뢰도 임계값: 0.25 (기본값)
+     └─ IoU 임계값: 0.45 (기본값)
+  
+  2) YOLO 내부 추적 (enable_tracking=True)
+     └─ 프레임 간 객체 ID 유지
+  
+  3) 각 감지 객체에 대해:
+     ├─ 바운딩박스 추출: [x1, y1, x2, y2]
+     ├─ 신뢰도 점수 (0~1)
+     ├─ 클래스 ID 및 클래스명
+     ├─ 객체 ID (추적 ID)
+     └─ 궤적 저장 (최대 20개 프레임)
+
+출력:
+  - annotated_image: 바운딩박스가 그려진 이미지
+  - detections: [{
+      'bbox': [x1, y1, x2, y2],
+      'confidence': float,
+      'class_id': int,
+      'object_id': int,
+      'class_name': str
+    }, ...]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[2단계] 칼만 필터 추적 (KalmanTracker.update())
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+목적: 노이즈 제거, 속도 추정, 궤적 부드럽게 함
+
+상태 벡터 (11차원):
+  ┌──────────────────────────────────────┐
+  │ x, y, z          → 3D 위치 (미터)   │
+  │ width, h, length → 3D 크기           │
+  │ yaw              → 회전 각도         │
+  │ vx, vy, vz       → 3D 속도           │
+  │ v_yaw            → 각속도             │
+  └──────────────────────────────────────┘
+
+칼만 필터 사이클:
+
+  1) 예측 단계 (Prediction)
+     └─ 이전 상태와 속도 기반으로 현재 상태 예측
+        state_predicted = F × state_previous + velocity × dt
+  
+  2) 측정값 준비
+     ├─ 깊이값 추출 (RealSense 또는 바운딩박스 크기로 추정)
+     │  └─ RealSense: 깊이 프레임에서 ROI(±20px) 중앙값 추출
+     │  └─ 웹캠: 바운딩박스 크기로부터 거리 추정
+     ├─ 위치: (x_norm, y_norm, depth)로 정규화
+     │  └─ x_norm = (center_x - width/2) / width  [-0.5, 0.5]
+     │  └─ y_norm = (center_y - height/2) / height [-0.5, 0.5]
+     └─ 크기 및 방향: 바운딩박스에서 추출
+  
+  3) 업데이트 단계 (Update)
+     └─ measurement와 prediction의 가중 평균으로 상태 갱신
+        state_updated = weighted_average(predicted, measured)
+  
+  4) 속도 추정
+     └─ velocity = (location_current - location_previous) / dt
+  
+  5) 이력 저장
+     └─ 최대 5 프레임 이력 유지
+
+출력:
+  filtered_state: {
+    'location': [x, y, z],
+    'velocity': [vx, vy, vz],
+    'dimensions': [h, w, l],
+    'orientation': yaw,
+    'angular_velocity': v_yaw,
+    ...추가 측정값들
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[3단계] 미래 위치 예측 (KalmanTracker.predict_future())
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+목적: 다음 1~2초 동안 객체의 예상 위치 계산
+
+방법: 등속 운동 모델 (Constant Velocity Model)
+
+  future_position(t) = current_position + velocity × t
+
+처리:
+  1) 예측 프레임 수: 16 (30fps 기준 ~0.5초)
+  2) 각 프레임별로 등속도로 진행하는 위치 계산
+     
+     Frame 0 (현재):   pos = [x0, y0, z0]
+     Frame 1:          pos = [x0 + vx/30, y0 + vy/30, z0 + vz/30]
+     Frame 2:          pos = [x0 + 2×vx/30, y0 + 2×vy/30, z0 + 2×vz/30]
+     ...
+     Frame 16:         pos = [x0 + 16×vx/30, y0 + 16×vy/30, z0 + 16×vz/30]
+
+출력:
+  future_positions: [
+    [x1, y1, z1],  # 1프레임 후
+    [x2, y2, z2],  # 2프레임 후
+    ...
+    [x16, y16, z16] # 16프레임 후
+  ]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[4단계] 충돌 위험도 평가 (CollisionRiskAssessment.assess_risk())
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【 4-1. 현재 상태 분석 】
+
+  1) 현재 거리 계산
+     current_distance = ||obj_position - ego_position||
+     └─ 3D 유클리드 거리 (미터)
+  
+  2) 현재 속도
+     current_velocity = ||obj_velocity||
+  
+  3) 상대 속도 계산 (음수 = 가까워짐)
+     ├─ 상대 위치 벡터: rel_pos = obj_pos - ego_pos
+     ├─ 정규화: direction = rel_pos / ||rel_pos||
+     ├─ 상대 속도 벡터: rel_vel = obj_vel - ego_vel
+     └─ 상대 속도: relative_speed = dot(rel_vel, direction)
+        → 음수면 자차에 접근 중
+
+【 4-2. Time-to-Collision (TTC) 계산 】
+
+  공식:
+    closing_speed = -dot(relative_velocity, direction)
+    safety_distance = (||obj_size|| + ||ego_size||) / 4
+    
+    TTC = (current_distance - safety_distance) / closing_speed
+  
+  조건:
+    ├─ closing_speed ≤ 0 → TTC = None (접근하지 않음)
+    ├─ TTC < 0 → TTC = 0.0 (이미 충돌 범위)
+    └─ TTC > 0 → 예상 충돌 시간(초)
+  
+  위험도 판정:
+    ├─ TTC < 2.0초 → DANGER (위험)
+    ├─ TTC < 3.5초 → CAUTION (주의)
+    └─ TTC ≥ 3.5초 → SAFE (안전)
+
+【 4-3. 충돌 확률 계산 (0.0 ~ 1.0) 】
+
+  여러 요소의 가중 합:
+  
+  prob = 0.0
+  
+  1) TTC 기반 (최대 0.6)
+     ├─ TTC < 2.0초 → +0.6
+     ├─ TTC < 3.5초 → +0.3
+     └─ 그 외 → +0.0
+  
+  2) 거리 기반 (최대 0.2)
+     └─ distance < 2.0m (안전거리) → +0.2
+  
+  3) 접근 속도 기반 (최대 0.2)
+     └─ relative_velocity < -0.3 m/s (빠르게 가까워짐) → +0.2
+  
+  최종: collision_probability = min(prob, 1.0)
+
+【 4-4. 위험도 등급 판정 (Risk Level & Score) 】
+
+  위험도 점수 계산 (0 ~ 100):
+  
+  risk_score = 0
+  
+  1) TTC 점수 (최대 40)
+     ├─ TTC < 2.0초 → +40
+     ├─ TTC < 3.5초 → +20
+     └─ 그 외 → +5
+  
+  2) 거리 점수 (최대 30)
+     ├─ distance < 2.0m → +30
+     ├─ distance < 3.0m → +15
+     └─ 그 외 → +5
+  
+  3) 접근 속도 점수 (최대 20)
+     ├─ relative_velocity < -0.5 m/s → +20
+     ├─ relative_velocity < -0.3 m/s → +10
+     └─ 그 외 → +0
+  
+  4) 충돌 확률 점수 (최대 10)
+     └─ +collision_probability × 10
+  
+  등급 결정:
+    ├─ risk_score ≥ 60 → 'DANGER' (위험)
+    ├─ risk_score ≥ 30 → 'CAUTION' (주의)
+    └─ risk_score < 30 → 'SAFE' (안전)
+
+【 4-5. 충돌 영향도 계산 (물리 기반) 】
+
+  클래스별 예상 질량:
+    person: 70kg, bicycle: 15kg, motorcycle: 150kg
+    car: 1500kg, truck/bus: 5000kg, 기타: 100kg
+  
+  충돌 에너지 (운동 에너지):
+    E = 0.5 × m × v²
+  
+  상대 에너지 (정규화):
+    reference_energy = 0.5 × 1500 × 5.0² = 18,750 J
+    actual_energy = 0.5 × mass × object_velocity²
+    impact = (actual_energy / reference_energy) × 100
+  
+  범위: 0 ~ 100
+
+출력:
+  RiskAssessment {
+    object_id: int
+    class_name: str
+    
+    현재 상태:
+    ├─ current_position: [x, y, z]
+    ├─ current_distance: float (미터)
+    ├─ current_velocity: float (m/s)
+    
+    미래 예측:
+    ├─ future_positions: [[x1,y1,z1], ..., [x16,y16,z16]]
+    └─ predicted_distance: float (미터, 16프레임 후)
+    
+    위험도 분석:
+    ├─ time_to_collision: float or None (초)
+    ├─ relative_velocity: float (m/s, 음수=접근)
+    ├─ approach_direction: [nx, ny, nz] (단위벡터)
+    ├─ collision_probability: float (0.0~1.0)
+    ├─ risk_level: 'safe'|'caution'|'danger'
+    ├─ risk_score: float (0~100)
+    
+    물리적 영향도:
+    └─ collision_impact: float (0~100)
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[5단계] 시각화 (Visualizer + VisualizationComposer + BirdEyeViewRenderer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【 5-1. 2D 프레임에 시각화 】
+
+  1) 3D 바운딩박스 그리기 (depth_value 기반)
+     ├─ 프론트 페이스: 2D 바운딩박스 (색상: 클래스별)
+     ├─ 백 페이스: 깊이 오프셋 적용
+     ├─ 연결선: 3D 깊이 효과
+     ├─ 반투명 오버레이: 3D 형태감
+     └─ 텍스트: ID, 클래스명, 신뢰도
+  
+  2) 위험도 지표 (좌상단)
+     ├─ 상태 표시: "DANGER" / "CAUTION" / "SAFE"
+     ├─ 색상: 빨강 / 주황 / 초록
+     ├─ 점수: 0~100
+     └─ 위험도 바: 막대 그래프
+  
+  3) 시스템 정보 오버레이
+     ├─ FPS (초당 프레임)
+     ├─ 실행 장치 (CPU/GPU)
+     └─ 추적 상태
+
+【 5-2. 조감도 (BirdEyeViewRenderer) 】
+
+  좌표계:
+    ├─ X축: 좌우 (lateral, -1 ~ +1)
+    ├─ Y축: 전후 (depth, 0.3m ~ 5.0m)
+    └─ 원점: 자차
+
+  각 객체 표시:
+    ├─ 원형: 객체 위치
+    ├─ 색상: 위험도 (빨강=danger, 주황=caution, 초록=safe)
+    ├─ 크기: 거리 (가까울수록 큼)
+    ├─ 텍스트: 객체 ID, 거리(m), 클래스명
+    └─ 영역: 위험도별 구분
+  
+  배경:
+    ├─ 그리드: 거리 마커 (0.5m 간격)
+    ├─ 자차: 중앙 삼각형
+    └─ 안전거리 원: 2.0m 반경
+
+【 5-3. 이미지 합성 】
+
+  ┌──────────────────┐
+  │  메인 프레임      │
+  │  (640x480)       │  ┌──────────┐
+  │  + 위험도 지표    │  │ 조감도   │
+  │  + 추적 정보      │  │ (우측 또는│
+  │                  │  │ 좌측 하단)│
+  └──────────────────┘  └──────────┘
+
+출력: 최종 영상 (display + 저장 가능)
+
+
+================================================================================
+【 데이터 흐름 요약 】
+
+Frame 0                   Frame 1                   Frame N
+  │                         │                         │
+  ├─ 입력 이미지            ├─ 입력 이미지            ├─ 입력 이미지
+  │                         │                         │
+  ▼                         ▼                         ▼
+[YOLO 감지]              [YOLO 감지]              [YOLO 감지]
+  │ detections            │ detections            │ detections
+  │                       │                       │
+  ▼                       ▼                       ▼
+[칼만 필터]              [칼만 필터]              [칼만 필터]
+  │ smoothed state        │ smoothed state        │ smoothed state
+  │ velocity              │ velocity              │ velocity
+  │                       │                       │
+  ▼                       ▼                       ▼
+[미래 위치 예측]         [미래 위치 예측]         [미래 위치 예측]
+  │ future positions      │ future positions      │ future positions
+  │                       │                       │
+  ▼                       ▼                       ▼
+[위험도 평가]            [위험도 평가]            [위험도 평가]
+  │ TTC, collision_prob   │ TTC, collision_prob   │ TTC, collision_prob
+  │ risk_level, score     │ risk_level, score     │ risk_level, score
+  │                       │                       │
+  ▼                       ▼                       ▼
+[시각화]                 [시각화]                 [시각화]
+  │ 3D Box + Risk         │ 3D Box + Risk         │ 3D Box + Risk
+  │ BEV + Info            │ BEV + Info            │ BEV + Info
+  │                       │                       │
+  ▼                       ▼                       ▼
+[출력]                   [출력]                   [출력]
+  ├─ Display              ├─ Display              ├─ Display
+  └─ Video File           └─ Video File           └─ Video File
+
+
+================================================================================
+【 핵심 파라미터 설정 】
+
+객체 감지 (ObjectDetectionCore):
+  - model_size: 'nano' (경량, 빠름)
+  - conf_threshold: 0.25 (신뢰도)
+  - iou_threshold: 0.45 (중복 제거)
+  - device: 'cpu' (또는 'cuda', 'mps')
+
+칼만 필터 (KalmanTracker):
+  - max_history: 5 (프레임 이력)
+  - process_noise_scale: 0.1 (프로세스 노이즈)
+  - measurement_noise_scale: 0.5 (측정 노이즈)
+
+위험도 평가 (CollisionRiskAssessment):
+  - prediction_frames: 16 (~0.5초 @ 30fps)
+  - TTC_DANGER: 2.0초
+  - TTC_CAUTION: 3.5초
+  - VELOCITY_THRESHOLD: 0.3 m/s
+  - SAFE_DISTANCE: 2.0m
+
+카메라:
+  - 해상도: 640x480 (RealSense 또는 웹캠)
+  - FPS: 30
+  - Depth scale (RealSense): 0.001 (밀리미터 → 미터)
+
+
+================================================================================
+【 실행 흐름 (ObjectTrackingPipeline.run()) 】
+
+시작
+  │
+  ├─ 카메라 초기화 (RealSense 또는 웹캠)
+  │
+  ├─ 모델 로드 (YOLO, 칼만 필터)
+  │
+  └─ 메인 루프:
+      │
+      ├─ 프레임 획득 (RealSense: RGB + Depth / 웹캠: RGB만)
+      │
+      ├─ process_frame():
+      │  ├─ 객체 감지
+      │  ├─ 칼만 필터 추적
+      │  ├─ 깊이 추출/추정
+      │  ├─ 미래 위치 예측
+      │  ├─ 위험도 평가
+      │  ├─ 시각화 (3D Box + BEV)
+      │  └─ 결과 반환
+      │
+      ├─ 결과 표시 (화면 + 저장)
+      │
+      ├─ 사용자 입력 확인 ('q' 또는 ESC)
+      │
+      └─ 반복
+  │
+  └─ 종료 & 리소스 정리
+
+================================================================================
+【 성능 지표 】
+
+처리 시간:
+  - YOLO 감지: ~15-30ms (nano, CPU)
+  - 칼만 필터: ~1-2ms
+  - 위험도 평가: ~5-10ms
+  - 시각화: ~10-20ms
+  - 총: ~30-60ms/프레임 (FPS: 15-30 @ CPU)
+
+메모리:
+  - YOLO nano: ~100MB
+  - 칼만 필터 (객체당): ~1KB
+  - 버퍼: ~10MB
+
+정확도:
+  - 객체 감지: mAP 기준 YOLO11n 수준
+  - 위험도 판정: TTC + 거리 + 속도 다중 요소 평가
+
+
+================================================================================
+【 외부 리뷰 피드백 】(AI Code Review)
+
+✅ 전체 평가: ISEF급 프로젝트 수준
+
+  - 구조: 9/10 (실전 ADAS/로봇 비전 파이프라인 구조)
+  - 현실성: 9/10
+  - 확장성: 8/10
+  - 안정성: 7/10
+  - 가독성: 9/10
+  └─ 평균: 8.4/10
+
+특징: "연구용 데모 시스템" 수준
+     (단순 학생 프로젝트는 이미 벗어남)
+
+✅ 매우 잘한 점 (개선 불필요)
+
+  ① 단계 분리 완벽
+     - Perception → Tracking → Prediction → Risk → Visualization
+     - 각 단계 역할 명확 → 유지보수/교체 용이
+
+  ② RealSense/Webcam 대응
+     - 깊이 있는/없는 경우 분리 (실전적)
+     - 많은 프로젝트가 여기서 실패하는데 잘 처리함
+
+  ③ 데이터 흐름 깨끗함
+     - detections → filtered_state → future → risk
+     - 중간 꼬인 구조 없음
+
+  ④ Kalman 필터 (11차원)
+     - 고등학생 기준 고급 수준
+     - 위치/크기/회전/각속도까지 포함 → 자율주행 논문 스타일
+
+  ⑤ 위험도 평가 (최고 강점!)
+     - TTC + 상대속도 + 확률화 + 에너지 다중 요소
+     - Rule-based + Physics 혼합 (ADAS 표준)
+
+  ⑥ 실시간성 문서화
+     - 30~60ms/frame 명시 → 엔지니어 마인드
+
+⚠️ 개선 가능한 점 (낮은 우선순위)
+
+  ① YOLO tracking + Kalman = 이중 추적
+     현재: YOLO 내부 추적 + Kalman 필터 중복
+     문제: ID 꼬임, ghost track 가능성
+     권장: 나중에 하나만 선택 (현재는 작동함)
+
+  ② Velocity 이중 계산
+     현재: velocity = (x_t - x_t-1) / dt + Kalman 내부 계산
+     개선: Kalman 상태만 사용하는 게 더 안정적
+
+❌ 진짜 문제점 (우선순위순)
+
+  ① 센서 오차 모델 약함
+     현재: ROI 중앙값만 사용
+     문제: noisy 환경에서 흔들림 큼
+     👉 개선책:
+        - Median + Temporal filter 추가
+        - 이상치(outlier) 제거 로직
+        - 장기적: Depth confidence map 활용
+
+  ② Ego motion 없음
+     현재: ego_velocity = 0 가정 (정지 상태)
+     문제: 자차가 움직이면 위험도 계산 틀어짐
+     현황: 보행자 감지면 아직 큰 영향 없음
+     👉 개선책:
+        - IMU/Odometry 연동
+        - 카메라 optical flow 보정
+        - 장기적: 자차 속도 입력 구현
+
+  ③ Data Association 구조 없음
+     현재: YOLO tracker에 전적 의존
+     문제: YOLO 흔들리면 전체 추적 무너짐
+     👉 개선책:
+        - Hungarian Algorithm (명시적 매칭)
+        - IOU + Cosine Distance 기반 추적
+        - 장기적: Multi-hypothesis tracking
+
+================================================================================
+【 개선 로드맵 (우선순위순) 】
+
+【Phase 1】 안정성 강화 (지금 바로 하면 좋음 - 2~3시간)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Priority 1: 깊이값 필터링 개선
+  파일: example_usage.py
+  위치: _estimate_depth_from_bbox() 함수
+  
+  현재:
+    valid_depths = depth_frame[roi]
+    depth = np.median(valid_depths)
+  
+  개선:
+    valid_depths = depth_frame[roi]
+    valid_depths = valid_depths[valid_depths > 0]  # 0값 제거
+    
+    # 이상치 제거 (IQR 방식)
+    Q1 = np.percentile(valid_depths, 25)
+    Q3 = np.percentile(valid_depths, 75)
+    IQR = Q3 - Q1
+    valid_depths = valid_depths[(valid_depths >= Q1-1.5*IQR) & 
+                                 (valid_depths <= Q3+1.5*IQR)]
+    
+    depth = np.median(valid_depths) if len(valid_depths) > 0 else prev_depth
+  
+  효과: 깊이 흔들림 50~70% 감소
+
+Priority 2: Temporal 필터 (깊이)
+  추가 메서드:
+    class DepthTemporalFilter:
+      def __init__(self, window_size=3):
+        self.buffer = deque(maxlen=window_size)
+      
+      def filter(self, depth):
+        self.buffer.append(depth)
+        return np.median(self.buffer)
+  
+  효과: 프레임 간 깊이 변동 완화
+
+Priority 3: 추적 안정성 (YOLO ID 유지)
+  현재: YOLO persist=True만 사용
+  
+  추가:
+    - ID 유지 임계값 조정
+    - 프레임 스킵 처리
+    - "ghost track" 정리 로직
+  
+  코드:
+    if len(active_ids) == 0 and previous_ids:
+      # 1프레임 miss 허용 (나중에 복구 가능)
+      pass
+    else:
+      # 2프레임 이상 miss → 객체 삭제
+      self.tracker.cleanup(active_ids)
+
+【Phase 2】 추적 고도화 (1~2주 - 중기 목표)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+① YOLO tracking 제거 / Kalman으로 단일화
+  현재: YOLO tracking + Kalman = 이중
+  목표: Kalman 중심으로 통일
+  
+  변경:
+    - YOLO: detection만 수행 (predict() 사용, track() 미사용)
+    - 매칭: Hungarian Algorithm으로 자체 구현
+    - 추적: Kalman만 담당
+  
+  장점:
+    - 이중 계산 제거
+    - ID 일관성 개선
+    - 성능 ~5% 향상
+
+② Velocity 계산 일원화
+  현재: 외부 계산 + Kalman 내부 계산
+  
+  개선:
+    filtered_velocity = kf.x[7:10]  # Kalman 상태만 사용
+    # 외부 계산 제거
+  
+  또는:
+    hybrid = 0.7 * kalman_velocity + 0.3 * observed_velocity
+  
+  추천: Kalman만 사용 (더 안정적)
+
+③ Hungarian Algorithm 추가
+  새 파일: association.py
+  
+  기능:
+    - IOU 계산 (바운딩박스)
+    - Cosine distance (특징)
+    - 최적 매칭
+  
+  코드 예시:
+    def match_detections(detections, tracked_objects):
+      cost_matrix = compute_iou_matrix(...)
+      matched_pairs = hungarian_algorithm(cost_matrix)
+      return matched_pairs
+
+【Phase 3】 센서 통합 (2~4주 - 장기 목표)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+① Ego motion 추가
+  입력: 자차 속도 (CAN bus / Odometry)
+  
+  구현:
+    risk_assessor.set_ego_state(ego_position, ego_velocity)
+  
+  변경 영향:
+    - relative_velocity 계산 개선
+    - TTC 정확도 향상
+  
+  예시:
+    if vehicle.has_speed_input():
+      ego_vel = vehicle.get_velocity()
+      risk_assessor.set_ego_state(ego_pos, ego_vel)
+
+② Confidence map 활용
+  기능: 깊이 신뢰도 기반 필터링
+  
+  구현:
+    depth_frame, confidence_frame = realsense.get_depth_with_confidence()
+    
+    valid_mask = confidence_frame > 0.7
+    filtered_depth = depth_frame * valid_mask
+
+③ Sensor Fusion (다중 센서)
+  예: LiDAR + RealSense
+  
+  구현:
+    depth = fuse_depth(realsense_depth, lidar_depth)
+
+【Phase 4】 고도화 (장기 비전)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+① 궤적 기반 위험도 (궤적의 미래 교점 계산)
+② Interactive POMDP (부분 관측성 고려)
+③ 행동 예측 (Behavior Prediction)
+④ 다중 시나리오 평가
+
+================================================================================
+【 개발 체크리스트 】
+
+Phase 1 (즉시):
+  ☐ 깊이값 이상치 제거 (IQR)
+  ☐ Temporal filter 추가
+  ☐ 추적 안정성 개선
+  ☐ 테스트 및 벤치마크
+
+Phase 2 (1~2주):
+  ☐ YOLO tracking 제거
+  ☐ Hungarian Algorithm 구현
+  ☐ Velocity 단일화
+  ☐ 통합 테스트
+
+Phase 3 (2~4주):
+  ☐ Ego motion 인터페이스
+  ☐ Confidence map 활용
+  ☐ 센서 융합 기본 구조
+
+Phase 4 (비전):
+  ☐ 궤적 분석
+  ☐ 행동 예측
+  ☐ 확률 모델 고도화
+
+================================================================================
+【 코드 품질 평가 】
+
+강점:
+  ✓ 주석 충분 (한국어로 명확)
+  ✓ 모듈 분리 잘함
+  ✓ 클래스 설계 깔끔
+  ✓ 타입 힌팅 (일부)
+  ✓ 에러 처리 (MPS fallback 등)
+
+개선 가능:
+  ⚠ 타입 힌팅 완성
+  ⚠ 단위 테스트 추가
+  ⚠ 설정 파일 분리 (config.yaml)
+  ⚠ 로깅 시스템 강화
+
+================================================================================
+                             문서 최종 수정: 2026-01-29
+                            (피드백 반영 완료)
+===============================================================================
