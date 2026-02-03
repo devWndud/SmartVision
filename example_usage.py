@@ -6,10 +6,19 @@
 import cv2
 import numpy as np
 import time
+from pathlib import Path
 from object_detection_core import ObjectDetectionCore
 from visualization_core import Visualizer, BirdEyeViewRenderer, VisualizationComposer
 from kalman_tracker import KalmanTracker
 from collision_risk_assessment import CollisionRiskAssessment
+from video_data_loader import VideoDataLoader
+
+# ==================== 테스트 데이터 설정 ====================
+# 저장된 테스트 데이터 경로를 설정하세요
+# None: 현재 D435i 카메라 사용
+# "data/recorded_sessions/camera_20260203_HHMMSS": 저장된 카메라 데이터 사용
+TEST_DATA_PATH = "data/recorded_sessions/camera_20260203_003647"
+# ============================================================
 
 
 class ObjectTrackingPipeline:
@@ -21,12 +30,12 @@ class ObjectTrackingPipeline:
     MIN_DEPTH_METERS = 0.3
     ROI_RADIUS = 20
     
-    def __init__(self, video_source=0, device='cpu', enable_bev=True):
+    def __init__(self, test_data_path=None, device='cpu', enable_bev=True):
         """
         초기화
         
         Args:
-            video_source (int or str): 비디오 소스 (0=웹캠, 파일 경로)
+            test_data_path (str or None): 테스트 데이터 경로 (None=카메라 사용)
             device (str): 실행 장치 ('cuda', 'cpu')
             enable_bev: BEV 시각화 활성화
         """
@@ -34,46 +43,69 @@ class ObjectTrackingPipeline:
         self.detector = ObjectDetectionCore(model_size='nano', device=device)
         self.tracker = KalmanTracker()
         self.visualizer = Visualizer(640, 480)
-        self.risk_assessor = CollisionRiskAssessment()  # 위험도 평가 엔진
+        self.risk_assessor = CollisionRiskAssessment()
         self.enable_bev = enable_bev
         self.device = device
         
-        # D435i 카메라 초기화 (RealSense)
+        # 테스트 데이터 모드
+        self.test_data_loader = None
+        self.test_frame_idx = 0
+        self.is_test_mode = False
         self.pipeline = None
         self.depth_scale = None
-        try:
-            import pyrealsense2 as rs
-            self.pipeline = rs.pipeline()
-            config = rs.config()
-            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-            self.pipeline.start(config)
-            
-            # Depth scale 획득
-            profile = self.pipeline.get_active_profile()
-            depth_sensor = profile.get_device().first_depth_sensor()
-            self.depth_scale = depth_sensor.get_depth_scale()
-            print(f"✓ D435i 카메라 초기화 완료")
-            print(f"  - Depth Scale: {self.depth_scale}")
-            print(f"  - 예상: 50cm 거리 → depth 값 ≈ {0.5 / self.depth_scale:.0f}")
-        except Exception as e:
-            print(f"⚠ D435i 초기화 실패: {e}")
-            self.pipeline = None
+        self.cap = None
         
-        # 비디오 소스 열기
-        if self.pipeline is None:
-            self.cap = cv2.VideoCapture(video_source)
-            if not self.cap.isOpened():
-                raise RuntimeError(f"비디오 소스를 열 수 없습니다: {video_source}")
+        if test_data_path:
+            # 테스트 데이터 모드
+            print(f"📂 테스트 데이터 로드: {test_data_path}")
+            try:
+                self.test_data_loader = VideoDataLoader(test_data_path)
+                self.is_test_mode = True
+                self.width = 640
+                self.height = 480
+                self.fps = int(self.test_data_loader.metadata.get('fps', 30)) or 30
+                print(f"✓ 테스트 데이터 로드 완료")
+                print(f"  - 총 프레임: {self.test_data_loader.metadata['total_frames']}")
+                print(f"  - 카메라 데이터: {self.test_data_loader.is_camera_data}")
+            except Exception as e:
+                print(f"❌ 테스트 데이터 로드 실패: {e}")
+                test_data_path = None
+        
+        if not test_data_path:
+            # 실시간 카메라 모드
+            self.is_test_mode = False
+            try:
+                import pyrealsense2 as rs
+                self.pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                self.pipeline.start(config)
+                
+                # Depth scale 획득
+                profile = self.pipeline.get_active_profile()
+                depth_sensor = profile.get_device().first_depth_sensor()
+                self.depth_scale = depth_sensor.get_depth_scale()
+                print(f"✓ D435i 카메라 초기화 완료")
+                print(f"  - Depth Scale: {self.depth_scale}")
+                print(f"  - 예상: 50cm 거리 → depth 값 ≈ {0.5 / self.depth_scale:.0f}")
+            except Exception as e:
+                print(f"⚠ D435i 초기화 실패: {e}")
+                self.pipeline = None
             
-            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
-        else:
-            self.width = 640
-            self.height = 480
-            self.fps = 30
-            self.cap = None
+            # 카메라가 없으면 비디오 파일 사용
+            if self.pipeline is None:
+                self.cap = cv2.VideoCapture(0)
+                if not self.cap.isOpened():
+                    raise RuntimeError("카메라 또는 비디오 소스를 사용할 수 없습니다")
+                
+                self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
+            else:
+                self.width = 640
+                self.height = 480
+                self.fps = 30
         
         # BirdEyeViewRenderer 크기 확대
         self.bev_renderer = BirdEyeViewRenderer(width=1000, height=1000, scale=150) if enable_bev else None
@@ -307,9 +339,16 @@ class ObjectTrackingPipeline:
         print(f"✓ 파이프라인 시작 (Device: {self.device})")
         print(f"✓ 해상도: {self.width}x{self.height}, FPS: {self.fps}")
         print(f"✓ 조감도: {'활성' if self.enable_bev else '비활성'}")
-        print(f"✓ RealSense 파이프라인: {'활성' if self.pipeline else '비활성 (일반 카메라)'}")
-        if self.pipeline:
-            print(f"  - Depth Scale: {self.depth_scale}")
+        
+        if self.is_test_mode:
+            print(f"✓ 테스트 데이터 모드 (총 {self.test_data_loader.metadata['total_frames']}프레임)")
+            print(f"  - 카메라 데이터: {self.test_data_loader.is_camera_data}")
+        else:
+            print(f"✓ 실시간 카메라 모드")
+            print(f"✓ RealSense 파이프라인: {'활성' if self.pipeline else '비활성 (일반 카메라)'}")
+            if self.pipeline:
+                print(f"  - Depth Scale: {self.depth_scale}")
+        
         print("✓ 'q' 또는 ESC로 종료")
         
         # 비디오 저장 설정 (메인 프레임)
@@ -328,14 +367,28 @@ class ObjectTrackingPipeline:
         
         try:
             while True:
-                if self.pipeline:
+                if self.is_test_mode:
+                    # 테스트 데이터 모드
+                    if self.test_frame_idx >= self.test_data_loader.metadata['total_frames']:
+                        print("✓ 테스트 데이터 재생 완료")
+                        break
+                    
+                    frame = self.test_data_loader.get_frame(self.test_frame_idx)
+                    depth_meters = self.test_data_loader.get_depth_map(self.test_frame_idx)
+                    
+                    self.test_frame_idx += 1
+                
+                elif self.pipeline:
+                    # 실시간 D435i 카메라
                     frames = self.pipeline.wait_for_frames()
                     color_frame, depth_frame = frames.get_color_frame(), frames.get_depth_frame()
                     if not (color_frame and depth_frame):
                         continue
                     frame = np.asanyarray(color_frame.get_data())
                     depth_meters = np.asanyarray(depth_frame.get_data()) * self.depth_scale
+                
                 else:
+                    # 일반 웹캠
                     ret, frame = self.cap.read()
                     if not ret:
                         print("✓ 비디오 재생 완료")
@@ -392,17 +445,18 @@ class ObjectTrackingPipeline:
 
 def main():
     """
-    주요 파라미터:
-    - video_source: 0=웹캠, 또는 비디오 파일 경로
-    - device: 'cpu' (권장) 또는 'cuda' (GPU 사용 시)
-    - enable_bev: True=조감도 표시, False=비활성화
+    테스트 데이터 또는 카메라를 사용하여 실행
+    
+    TEST_DATA_PATH 변수로 모드 선택:
+    - None: 실시간 D435i 카메라 사용
+    - "data/recorded_sessions/camera_20260203_HHMMSS": 저장된 카메라 데이터 사용
     
     출력 옵션:
     - output_file: 메인 프레임 영상 저장
     - output_bev_file: BEV 전용 영상 저장
     """
     pipeline = ObjectTrackingPipeline(
-        video_source=0,
+        test_data_path=TEST_DATA_PATH,
         device='cpu',
         enable_bev=True
     )
